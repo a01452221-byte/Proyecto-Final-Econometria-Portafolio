@@ -1,0 +1,928 @@
+---
+title: "Proyecto final de Econometría: portafolio de 10 acciones"
+subtitle: "Regresión simple y múltiple, datos de panel, series de tiempo, GARCH y estrategia en HowMarketsWorks"
+author: "Marco Antonio Acevedo Mendoza"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+  word_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5)
+```
+
+**Fuente de datos:** LSEG Workspace (Refinitiv). Precios de 5 min (5 oct - 6 nov 2026), 30 min (may - nov 2026), diarios (2020 - 2026) y estados financieros trimestrales (2021 - 2026).
+
+**Portafolio:** MU, AMD, META, VST, CEG, FSLR, HCA, ABNB, LLY y JPM. Variables de mercado: SPY (S&P 500), QQQ (Nasdaq-100) y VIX.
+
+
+
+> Ejercicio académico con dinero simulado. Ningún resultado es una recomendación de inversión.
+
+# Librerías
+
+```{r paquetes}
+# Lectura y manipulación de datos
+library(readxl)      # leer los .xlsx exportados de LSEG (Refinitiv)
+library(dplyr)       # manipulación de tablas
+library(tidyr)       # pasar de formato largo a ancho
+library(purrr)       # aplicar funciones a todos los archivos
+library(stringr)     # limpiar nombres de archivo / tickers
+library(lubridate)   # fechas, horas y zonas horarias
+library(zoo)         # series de tiempo
+library(xts)         # series de tiempo financieras (índice de fecha-hora)
+library(ggplot2)     # gráficas
+
+# Regresión lineal simple y múltiple (Gujarati caps. 3-13)
+library(lmtest)      # coeftest, Breusch-Pagan, Durbin-Watson
+library(sandwich)    # errores estándar robustos (White, Newey-West)
+library(car)         # VIF (multicolinealidad), pruebas F lineales
+
+# Datos de panel (Gujarati cap. 16)
+library(plm)         # MCO agrupado, efectos fijos, aleatorios, Hausman
+
+# Series de tiempo y pronóstico (Gujarati caps. 21-22)
+library(tseries)     # prueba ADF
+library(forecast)    # auto.arima, forecast
+library(rugarch)     # GARCH(1,1), GJR-GARCH
+library(FinTS)       # prueba ARCH-LM
+library(quadprog)    # optimización del portafolio
+
+# OJO: plm y xts se cargan después de dplyr y tapan lag(), lead(), first() y last().
+# Por eso en todo el cuaderno se escribe dplyr::lag(), dplyr::lead(), dplyr::first()...
+options(xts_check_TZ = FALSE)   # evita el aviso de zona horaria NY vs CDMX
+```
+
+# Parámetros del proyecto
+
+```{r parametros}
+# Carpeta con los .xlsx de LSEG (ajústala a tu ruta).
+# Nombres esperados: TICKER_5min.xlsx, TICKER_30min.xlsx, TICKER_daily.xlsx, TICKER_trimestral.xlsx
+DIR_DATOS <- "datos"   # carpeta con los 49 archivos de LSEG
+
+ACCIONES <- c("MU", "AMD", "META", "VST", "CEG", "FSLR", "HCA", "ABNB", "LLY", "JPM")
+MERCADO  <- c("SPY", "QQQ", "VIX")
+TICKERS  <- c(ACCIONES, MERCADO)
+ACTIVO   <- "META"            # acción para los ejemplos detallados
+
+# Sesión regular en hora de Nueva York. LSEG etiqueta cada barra con su hora de CIERRE:
+# la barra de 09:35 cubre 09:30-09:35. Sesión: 09:35-16:00 (78 barras de 5 min, 13 de 30 min).
+TZ_MERCADO <- "America/New_York"
+INICIO_SES <- "09:35"
+FIN_SES    <- "16:00"
+
+# Muestra diaria común: CEG cotiza desde el 19-ene-2022 (separación de Exelon)
+INICIO_D <- as.Date("2022-01-19")
+
+# Eventos (variables dummy)
+F_ELECCION   <- as.Date("2026-11-04")   # reacción a las elecciones intermedias
+F_SELLOFF_IA <- as.Date("2026-11-05")   # caída de -5.5% del Nasdaq por temor a regulación de IA
+
+# Portafolio en HowMarketsWorks: compra en la apertura y venta antes del cierre del lunes 9-nov
+CAPITAL   <- 894529.21   # capital disponible en USD
+COLCHON   <- 0.02        # 2% en efectivo para cubrir el precio de apertura y comisiones
+TOPE_PESO <- 0.25        # peso máximo por acción
+RF_ANUAL  <- 4.0         # tasa libre de riesgo anual en %
+MULT_SL   <- 1.5         # stop-loss / take-profit a ±1.5 desviaciones estándar de la sesión
+```
+
+# Lectura de los datos de LSEG
+
+## Precios (5 min, 30 min y diarios)
+
+
+```{r funcion_lectura}
+leer_lseg <- function(archivo) {
+  bruto  <- read_excel(archivo, col_names = FALSE, .name_repair = "minimal")
+  fila_h <- which(trimws(as.character(bruto[[1]])) == "Exchange Date")[1]
+  if (is.na(fila_h)) stop("No encontré 'Exchange Date' en ", archivo)
+
+  datos <- read_excel(archivo, skip = fila_h - 1, .name_repair = "minimal")
+  datos <- datos[, names(datos) != "" & !is.na(names(datos))]
+  if (!"Volume" %in% names(datos)) datos$Volume <- NA_real_      # el VIX no tiene volumen
+
+  ticker <- basename(archivo) |>
+    str_remove("^[0-9a-f]{8}-") |>                                 # por si trae prefijo
+    str_remove("_(5min|30min|daily|trimestral)\\.xlsx$") |>
+    toupper()
+  intradia <- "Exchange Time" %in% names(datos)
+
+  datos |>
+    filter(!is.na(`Exchange Date`)) |>
+    transmute(
+      ticker = ticker,
+      fh     = if (intradia) with_tz(force_tz(as.POSIXct(`Exchange Date`), "UTC"), TZ_MERCADO)
+               else as.POSIXct(as.Date(`Exchange Date`)),
+      fecha  = if (intradia) as.Date(fh, tz = TZ_MERCADO) else as.Date(`Exchange Date`),
+      open   = as.numeric(Open), high = as.numeric(High),
+      low    = as.numeric(Low),  close = as.numeric(Close),
+      volume = as.numeric(Volume)
+    ) |>
+    arrange(fh)
+}
+
+leer_frecuencia <- function(sufijo) {
+  archivos <- list.files(DIR_DATOS, pattern = paste0("_", sufijo, "\\.xlsx$"),
+                         full.names = TRUE, ignore.case = TRUE)
+  d <- map_dfr(archivos, leer_lseg)
+  faltan <- setdiff(TICKERS, unique(d$ticker))
+  if (length(faltan) > 0) warning("Faltan archivos ", sufijo, ": ", paste(faltan, collapse = ", "))
+  d
+}
+
+crudo_5m  <- leer_frecuencia("5min")
+crudo_30m <- leer_frecuencia("30min")
+crudo_d   <- leer_frecuencia("daily")
+```
+
+## Limpieza y creación de variables
+
+```{r funcion_preparar}
+preparar <- function(crudo, intradia) {
+  d <- crudo |> filter(!is.na(close))
+  if (intradia) {
+    d <- d |> mutate(hora = format(fh, "%H:%M")) |>
+      filter(hora >= INICIO_SES, hora <= FIN_SES)
+  }
+  # Solo días en que operó la bolsa de acciones (quita feriados en que el VIX sí cotizó)
+  dias_bolsa <- unique(d$fecha[d$ticker == "SPY"])
+  d <- d |> filter(fecha %in% dias_bolsa) |> arrange(ticker, fh)
+
+  d <- d |>
+    group_by(ticker) |>
+    mutate(ret_total = 100 * log(close / dplyr::lag(close)),
+           d_nivel   = close - dplyr::lag(close)) |>
+    group_by(ticker, fecha) |>
+    mutate(barra = row_number()) |>
+    ungroup()
+
+  if (intradia) {
+    d <- d |> mutate(
+      ret_overnight = if_else(barra == 1, ret_total, NA_real_),
+      ret           = if_else(barra == 1, NA_real_, ret_total),
+      d_nivel       = if_else(barra == 1, NA_real_, d_nivel),
+      apertura      = as.integer(hora <= "10:30"),
+      cierre        = as.integer(hora >  "15:30"))
+  } else {
+    d <- d |> mutate(ret = ret_total,
+                     lunes = as.integer(wday(fecha, week_start = 1) == 1))
+  }
+
+  d |> mutate(rango      = 100 * log(high / low),
+              log_vol    = log1p(volume),
+              d_eleccion = as.integer(fecha == F_ELECCION),
+              d_selloff  = as.integer(fecha == F_SELLOFF_IA))
+}
+
+agregar_mercado <- function(p) {
+  m <- p |>
+    filter(ticker %in% MERCADO) |>
+    select(fh, ticker, ret, close, d_nivel) |>
+    pivot_wider(names_from = ticker, values_from = c(ret, close, d_nivel)) |>
+    transmute(fh, r_spy = ret_SPY, r_qqq = ret_QQQ,
+              f_tec = ret_QQQ - ret_SPY, vix = close_VIX, d_vix = d_nivel_VIX)
+  p |>
+    filter(ticker %in% ACCIONES) |>
+    left_join(m, by = "fh") |>
+    mutate(ticker = factor(ticker, levels = ACCIONES))
+}
+
+p5  <- preparar(crudo_5m,  intradia = TRUE)
+p30 <- preparar(crudo_30m, intradia = TRUE)
+pd_ <- preparar(crudo_d,   intradia = FALSE)
+
+acc_5m  <- agregar_mercado(p5)
+acc_30m <- agregar_mercado(p30)
+acc_d   <- agregar_mercado(pd_) |> filter(fecha >= INICIO_D)
+
+# Lista con las tres frecuencias (la usan todas las secciones)
+FRECS <- list("5 min" = acc_5m, "30 min" = acc_30m, "Diario" = acc_d)
+
+# Control de calidad: barras por día (deben ser 78, 13 y 1)
+bind_rows(
+  p5  |> count(ticker, fecha) |> mutate(frec = "5 min"),
+  p30 |> count(ticker, fecha) |> mutate(frec = "30 min")) |>
+  group_by(frec, ticker) |>
+  summarise(dias = n(), min_barras = min(n), max_barras = max(n), .groups = "drop") |>
+  pivot_wider(names_from = frec, values_from = c(dias, min_barras, max_barras))
+```
+
+## Matrices de rendimientos (formato ancho)
+
+```{r formato_ancho}
+a_matriz <- function(p, desde = as.Date("1900-01-01")) {
+  w <- p |>
+    filter(fecha >= desde) |>
+    select(fh, ticker, ret) |>
+    pivot_wider(names_from = ticker, values_from = ret) |>
+    arrange(fh)
+  na.omit(xts(select(w, all_of(TICKERS)), order.by = w$fh))
+}
+R5  <- a_matriz(p5)
+R30 <- a_matriz(p30)
+RD  <- a_matriz(pd_, desde = INICIO_D)
+sapply(list("5 min" = R5, "30 min" = R30, "Diario" = RD), dim)
+```
+
+## Estados financieros trimestrales
+
+Los archivos trimestrales traen las variables en filas y los trimestres en columnas. La función toma solo las filas que usaremos y las transpone.
+
+```{r lectura_trimestral}
+CAMPOS <- c(
+  ingresos   = "Revenue from Business Activities - Total",
+  eps        = "EPS - Diluted - excluding Extraordinary Items Applicable to Common - Total",
+  margen     = "Net Margin - %",
+  deuda_act  = "Total Debt Percentage of Total Assets",
+  acciones_c = "Common Shares - Outstanding - Total",
+  roa        = "Return on Average Total Assets - % (Income before Discontinued Operations & Extraordinary Items), TTM")
+
+leer_trimestral <- function(archivo) {
+  b <- read_excel(archivo, col_names = FALSE, .name_repair = "minimal")
+  nombres <- trimws(as.character(b[[1]]))
+  fila_f  <- which(nombres == "Period End Date")[1]
+  fechas  <- as.Date(as.numeric(unlist(b[fila_f, -1])), origin = "1899-12-30")
+  if (all(is.na(fechas))) fechas <- as.Date(unlist(lapply(b[fila_f, -1], as.character)))
+  ok <- !is.na(fechas)
+
+  valores <- sapply(CAMPOS, function(campo) {
+    fila <- which(nombres == campo)[1]                 # primera aparición
+    if (is.na(fila)) return(rep(NA_real_, sum(ok)))
+    suppressWarnings(as.numeric(unlist(b[fila, -1])))[ok]
+  })
+  tibble(ticker = str_remove(toupper(basename(archivo)), "_TRIMESTRAL\\.XLSX$") |>
+                  str_remove("^[0-9A-F]{8}-"),
+         fin_periodo = fechas[ok]) |>
+    bind_cols(as_tibble(valores))
+}
+
+trim_crudo <- list.files(DIR_DATOS, pattern = "_trimestral\\.xlsx$",
+                         full.names = TRUE, ignore.case = TRUE) |>
+  map_dfr(leer_trimestral)
+
+trim_crudo |> group_by(ticker) |>
+  summarise(trimestres = n(), desde = min(fin_periodo), hasta = max(fin_periodo))
+```
+
+# Estadística descriptiva
+
+```{r descriptiva}
+resumen <- function(df, etiqueta) {
+  df |>
+    filter(!is.na(ret)) |>
+    group_by(ticker) |>
+    summarise(n = n(), media = mean(ret), desv_est = sd(ret),
+              minimo = min(ret), maximo = max(ret),
+              asimetria = mean((ret - mean(ret))^3) / sd(ret)^3,
+              curtosis  = mean((ret - mean(ret))^4) / sd(ret)^4, .groups = "drop") |>
+    mutate(frecuencia = etiqueta, .before = 1)
+}
+desc <- imap_dfr(FRECS, resumen)
+knitr::kable(desc, digits = 3, caption = "Rendimientos logarítmicos (%) por frecuencia")
+```
+
+```{r grafica_precios, fig.height = 7}
+p30 |>
+  filter(ticker %in% ACCIONES) |>
+  group_by(ticker) |>
+  mutate(indice = 100 * close / dplyr::first(close)) |>
+  ungroup() |>
+  ggplot(aes(fh, indice)) +
+  geom_line(linewidth = 0.4, colour = "steelblue") +
+  geom_vline(xintercept = as.POSIXct(c("2026-11-04 09:30", "2026-11-05 09:30"), tz = TZ_MERCADO),
+             linetype = "dashed", colour = "grey40") +
+  facet_wrap(~ ticker, ncol = 5, scales = "free_y") +
+  labs(title = "Precio normalizado (base 100 = mayo 2026), barras de 30 min",
+       subtitle = "Líneas punteadas: elecciones (4 nov) y caída de IA (5 nov)", x = NULL, y = NULL) +
+  theme_minimal()
+```
+
+## Horas seleccionadas: estacionalidad intradía
+
+```{r estacionalidad, fig.height = 4}
+acc_5m |>
+  filter(!is.na(ret)) |>
+  group_by(hora) |>
+  summarise(vol_abs = mean(abs(ret)), volumen = mean(log_vol, na.rm = TRUE), .groups = "drop") |>
+  ggplot(aes(as.POSIXct(paste("2026-01-01", hora)), vol_abs)) +
+  geom_col(fill = "steelblue") +
+  scale_x_datetime(date_labels = "%H:%M", date_breaks = "30 min") +
+  labs(title = "Rendimiento absoluto promedio por barra de 5 min (10 acciones)",
+       subtitle = "Hora de Nueva York (CDMX = NY - 1 h en noviembre)", x = NULL, y = "|ret| promedio (%)") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+```
+
+
+# Regresión lineal simple: modelo de mercado (beta)
+
+$$r_{i,t} = \alpha_i + \beta_i\, r_{SPY,t} + u_{i,t}$$
+
+
+```{r mco_simple}
+mco_simple <- function(df) {
+  m  <- lm(ret ~ r_spy, data = df)
+  nw <- coeftest(m, vcov = NeweyWest(m, prewhite = FALSE))
+  tibble(alfa = coef(m)[1], beta = coef(m)[2],
+         ee_beta_NW = nw["r_spy", 2], t_beta = nw["r_spy", 3], p_beta = nw["r_spy", 4],
+         R2 = summary(m)$r.squared, n = nobs(m))
+}
+
+betas <- imap_dfr(FRECS, function(df, frec)
+  df |> filter(!is.na(ret), !is.na(r_spy)) |>
+    group_by(ticker) |> group_modify(~ mco_simple(.x)) |> ungroup() |>
+    mutate(frecuencia = frec, .before = 1))
+
+knitr::kable(betas, digits = 3, caption = "Modelo de mercado por acción y frecuencia (EE Newey-West)")
+
+betas |>
+  select(ticker, frecuencia, beta) |>
+  pivot_wider(names_from = frecuencia, values_from = beta) |>
+  knitr::kable(digits = 2, caption = "Beta por frecuencia")
+```
+
+
+
+```{r mco_simple_detalle, fig.height = 7}
+# 1) Una regresión por acción (diario)
+modelos_simple <- acc_d |>
+  filter(!is.na(ret), !is.na(r_spy)) |>
+  droplevels() |>
+  (\(d) split(d, d$ticker))() |>
+  map(~ lm(ret ~ r_spy, data = .x))
+
+# 2) Coeficientes con EE Newey-West e intervalos de confianza de cada acción
+for (tk in ACCIONES) {
+  m <- modelos_simple[[tk]]
+  cat(sprintf("\n========== %s vs. SPY | R2 = %.3f | n = %d ==========\n",
+              tk, summary(m)$r.squared, nobs(m)))
+  print(coeftest(m, vcov = NeweyWest(m, prewhite = FALSE)))
+  print(round(confint(m), 4))
+}
+
+# 3) Gráfica: las 10 acciones contra el SPY, con su beta y R2
+etiquetas <- betas |>
+  filter(frecuencia == "Diario") |>
+  mutate(texto = sprintf("beta = %.2f\nR2 = %.2f", beta, R2))
+
+ggplot(filter(acc_d, !is.na(ret), !is.na(r_spy)), aes(r_spy, ret)) +
+  geom_point(alpha = 0.2, size = 0.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_smooth(method = "lm", se = TRUE, colour = "red", linewidth = 0.6) +
+  geom_text(data = etiquetas, aes(x = -Inf, y = Inf, label = texto),
+            hjust = -0.1, vjust = 1.2, size = 3, inherit.aes = FALSE) +
+  facet_wrap(~ ticker, ncol = 5) +
+  labs(title = "Modelo de mercado diario: cada acción vs. S&P 500 (2022-2026)",
+       subtitle = "Línea roja: recta de MCO | línea punteada: beta = 1 (se mueve igual que el mercado)",
+       x = "Rendimiento SPY (%)", y = "Rendimiento de la acción (%)") +
+  theme_minimal()
+```
+
+
+# Regresión lineal múltiple
+
+$$r_{i,t} = \beta_0 + \beta_1 r_{SPY,t} + \beta_2 f_{tec,t} + \beta_3 \Delta VIX_t + \beta_4\,\text{eventos/estacionalidad} + u_t$$
+
+- **Intradía:** + `apertura` + `cierre` + `d_eleccion` + `d_selloff`
+- **Diario:** + `lunes` + `d_eleccion` + `d_selloff`
+
+```{r mco_multiple}
+formula_mult <- function(frec) {
+  if (frec == "Diario") ret ~ r_spy + f_tec + d_vix + lunes + d_eleccion + d_selloff
+  else                  ret ~ r_spy + f_tec + d_vix + apertura + cierre + d_eleccion + d_selloff
+}
+
+mco_mult <- function(df, frec) {
+  m  <- lm(formula_mult(frec), data = df)
+  nw <- coeftest(m, vcov = NeweyWest(m, prewhite = FALSE))
+  est <- setNames(nw[, 1], rownames(nw))
+  tv  <- setNames(nw[, 3], paste0("t_", rownames(nw)))
+  tibble(!!!as.list(round(est, 4)), !!!as.list(round(tv, 2)),
+         R2_aj   = summary(m)$adj.r.squared,
+         VIF_max = max(vif(m)),
+         BP_p    = bptest(m)$p.value,
+         DW      = unname(dwtest(m)$statistic),
+         n       = nobs(m))
+}
+
+mult <- imap_dfr(FRECS, function(df, frec)
+  df |> filter(!is.na(ret), !is.na(r_spy), !is.na(d_vix)) |>
+    group_by(ticker) |> group_modify(~ mco_mult(.x, frec)) |> ungroup() |>
+    mutate(frecuencia = frec, .before = 1))
+
+mult |>
+  select(frecuencia, ticker, r_spy, t_r_spy, f_tec, t_f_tec, d_vix, t_d_vix,
+         d_selloff, t_d_selloff, R2_aj, VIF_max, BP_p, DW) |>
+  knitr::kable(digits = 3, caption = "Regresión múltiple: coeficientes y t de Newey-West")
+```
+
+## Ejemplo detallado y diagnóstico: diario
+
+```{r mco_multiple_detalle}
+# Una regresión múltiple por acción (diario)
+modelos_mult <- acc_d |>
+  filter(!is.na(ret), !is.na(r_spy), !is.na(d_vix)) |>
+  droplevels() |>
+  (\(d) split(d, d$ticker))() |>
+  map(~ lm(formula_mult("Diario"), data = .x))
+modelos_mult <- modelos_mult[ACCIONES]
+
+# Coeficientes con errores estándar Newey-West de cada acción
+for (tk in ACCIONES) {
+  m <- modelos_mult[[tk]]
+  cat(sprintf("\n========== %s | R2 ajustado = %.3f | n = %d ==========\n",
+              tk, summary(m)$adj.r.squared, nobs(m)))
+  print(coeftest(m, vcov = NeweyWest(m, prewhite = FALSE)))
+}
+
+# Tabla de pruebas y diagnóstico para las 10 acciones
+pruebas_mult <- imap_dfr(modelos_mult, function(m, tk) {
+  d  <- model.frame(m)
+  m0 <- lm(ret ~ r_spy, data = d)                 # modelo simple con la misma muestra
+  nw <- NeweyWest(m, prewhite = FALSE)
+  dw <- dwtest(m)
+  tibble(ticker = tk,
+         R2aj_simple   = summary(m0)$adj.r.squared,
+         R2aj_multiple = summary(m)$adj.r.squared,
+         F_anidado_p   = anova(m0, m)$`Pr(>F)`[2],
+         F_ftec_vix_p  = linearHypothesis(m, c("f_tec = 0", "d_vix = 0"), vcov. = nw)$`Pr(>F)`[2],
+         VIF_max       = max(vif(m)),
+         BP_p          = bptest(m)$p.value,
+         DW            = unname(dw$statistic),
+         DW_p          = dw$p.value)
+})
+
+knitr::kable(pruebas_mult, digits = 3,
+             caption = "Pruebas de la regresión múltiple diaria por acción")
+```
+
+```{r residuos_mult, fig.height = 6}
+resid_df <- imap_dfr(modelos_mult, ~ tibble(ticker = .y, ajustado = fitted(.x),
+                                            residuo = resid(.x))) |>
+  mutate(ticker = factor(ticker, levels = ACCIONES))
+
+ggplot(resid_df, aes(ajustado, residuo)) +
+  geom_point(size = 0.4, alpha = 0.3) +
+  geom_hline(yintercept = 0, colour = "red") +
+  facet_wrap(~ ticker, ncol = 5, scales = "free") +
+  labs(title = "Residuos vs. valores ajustados", x = "Ajustados", y = "Residuos") +
+  theme_minimal()
+
+ggplot(resid_df, aes(sample = residuo)) +
+  stat_qq(size = 0.4, alpha = 0.4) +
+  stat_qq_line(colour = "red") +
+  facet_wrap(~ ticker, ncol = 5, scales = "free") +
+  labs(title = "QQ-plot de residuos (normalidad)", x = "Cuantiles teóricos", y = "Residuos") +
+  theme_minimal()
+```
+
+
+# Datos de panel: reportes trimestrales
+
+**Pregunta:** ¿qué fundamentales del reporte trimestral explican el rendimiento de la acción?
+
+$$r_{i,t} = \beta_1\,\Delta EPS/P_{i,t} + \beta_2\,\text{crec. ingresos}_{i,t} + \beta_3\,\text{margen neto}_{i,t} + \beta_4\,\text{deuda/activos}_{i,t} + \beta_5 \ln(\text{cap. mercado})_{i,t-1} + \alpha_i + u_{i,t}$$
+
+```{r panel_construccion}
+fin_trim_cercano <- function(f) {
+  sig <- ceiling_date(f, "quarter") - days(1)
+  ant <- floor_date(f, "quarter") - days(1)
+  if_else(as.numeric(sig - f) <= as.numeric(f - ant), sig, ant)
+}
+
+# Precio de cierre al final de cada trimestre (último día hábil <= fin de trimestre)
+precio_al <- function(tk, fechas) {
+  s <- pd_ |> filter(ticker == tk) |> arrange(fecha)
+  i <- findInterval(fechas, s$fecha)
+  ifelse(i == 0, NA_real_, s$close[pmax(i, 1)])     # NA si la fecha es anterior al primer precio
+}
+
+panel <- trim_crudo |>
+  filter(ticker %in% ACCIONES) |>
+  mutate(trimestre = fin_trim_cercano(fin_periodo)) |>
+  arrange(ticker, trimestre) |>
+  group_by(ticker) |>
+  mutate(precio     = precio_al(dplyr::first(ticker), trimestre),
+         precio_ant = precio_al(dplyr::first(ticker), floor_date(trimestre, "quarter") - days(1)),
+         precio_sig = precio_al(dplyr::first(ticker), ceiling_date(trimestre + days(1), "quarter") - days(1)),
+         ret_trim   = 100 * log(precio / precio_ant),
+         ret_sig    = 100 * log(precio_sig / precio),
+         cap_merc   = acciones_c * precio,                       # millones de USD
+         ln_cap     = log(dplyr::lag(cap_merc)),
+         d_eps_p    = 100 * (eps - dplyr::lag(eps, 4)) / precio,
+         crec_ing   = 100 * log(ingresos / dplyr::lag(ingresos, 4))) |>
+  ungroup() |>
+  mutate(ret_sig = if_else(trimestre >= floor_date(max(pd_$fecha), "quarter") - days(1),
+                           NA_real_, ret_sig),                 # el trimestre siguiente aún no termina
+         etiqueta = paste0(year(trimestre), "T", quarter(trimestre)))
+
+# Verificación: un solo reporte por empresa y trimestre
+stopifnot(!any(duplicated(panel[, c("ticker", "trimestre")])))
+
+vars_panel <- c("d_eps_p", "crec_ing", "margen", "deuda_act", "ln_cap")
+panel_m <- panel |> filter(if_all(all_of(c("ret_trim", vars_panel)), ~ !is.na(.x)))
+
+panel_m |> count(ticker, name = "trimestres_utiles")
+summary(select(panel_m, ret_trim, ret_sig, all_of(vars_panel)))
+```
+
+```{r panel_modelos}
+pdat <- pdata.frame(as.data.frame(panel_m), index = c("ticker", "etiqueta"))
+f_cont <- ret_trim ~ d_eps_p + crec_ing + margen + deuda_act + ln_cap
+
+mod_pool <- plm(f_cont, data = pdat, model = "pooling")
+mod_fe   <- plm(f_cont, data = pdat, model = "within", effect = "individual")
+mod_fe2  <- plm(f_cont, data = pdat, model = "within", effect = "twoways")
+mod_re   <- tryCatch(plm(f_cont, data = pdat, model = "random"),
+                     error = function(e) plm(f_cont, data = pdat, model = "random",
+                                             random.method = "amemiya"))
+
+# Errores estándar robustos agrupados por empresa (Arellano)
+rob <- function(m) coeftest(m, vcov = vcovHC(m, method = "arellano", type = "HC1", cluster = "group"))
+
+tabla_panel <- function(modelos) {
+  map_dfr(names(modelos), function(nm) {
+    ct <- rob(modelos[[nm]])
+    tibble(modelo = nm, variable = rownames(ct), coef = ct[, 1], t = ct[, 3], p = ct[, 4])
+  }) |>
+    mutate(celda = sprintf("%.3f%s", coef, ifelse(p < 0.01, "***", ifelse(p < 0.05, "**", ifelse(p < 0.1, "*", ""))))) |>
+    select(modelo, variable, celda) |>
+    pivot_wider(names_from = modelo, values_from = celda, values_fill = "")
+}
+
+modelos <- list("MCO agrupado" = mod_pool, "Efectos fijos" = mod_fe,
+                "EF dos vías" = mod_fe2, "Efectos aleatorios" = mod_re)
+knitr::kable(tabla_panel(modelos),
+             caption = "Panel: rendimiento trimestral contemporáneo (EE robustos por empresa; *** 1%, ** 5%, * 10%)")
+
+sapply(modelos, function(m) round(summary(m)$r.squared[["rsq"]], 3))
+```
+
+## Pruebas para elegir el modelo
+
+```{r panel_pruebas}
+cat("1) Prueba F de efectos individuales (H0: MCO agrupado es suficiente)\n")
+pFtest(mod_fe, mod_pool)
+
+cat("\n2) Breusch-Pagan LM (H0: varianza del efecto aleatorio = 0, MCO agrupado es suficiente)\n")
+plmtest(mod_pool, type = "bp")
+
+cat("\n3) Hausman (H0: efectos aleatorios es consistente y eficiente)\n")
+phtest(mod_fe, mod_re)
+
+cat("\n4) Efectos de tiempo (H0: no hacen falta dummies de trimestre)\n")
+pFtest(mod_fe2, mod_fe)
+```
+
+**Cómo decidir (Gujarati cap. 16):**
+
+1. **Prueba F** con p < 0.05: hay diferencias permanentes entre empresas → MCO agrupado está sesgado.
+2. **Breusch-Pagan LM** con p < 0.05: el efecto aleatorio es relevante → preferir RE sobre agrupado.
+3. **Hausman** con p < 0.05: los efectos individuales están correlacionados con los regresores → **efectos fijos**. Con p > 0.05 → **efectos aleatorios** (más eficiente).
+4. Si los efectos de tiempo son significativos, el trimestre común (por ejemplo, el mercado en general) importa → modelo de **dos vías**. En acciones casi siempre pasa, porque todas se mueven con el mercado.
+
+
+# Series de tiempo: estacionariedad y pronóstico ARIMA
+
+## Prueba de raíz unitaria (Dickey-Fuller aumentada)
+
+```{r adf}
+adf_p <- function(x) suppressWarnings(adf.test(na.omit(as.numeric(x)))$p.value)
+
+pd_precios <- pd_ |> filter(ticker %in% ACCIONES, fecha >= INICIO_D)
+adf_tab <- pd_precios |>
+  group_by(ticker) |>
+  summarise(p_log_precio  = adf_p(log(close)),
+            p_rendimiento = adf_p(ret), .groups = "drop") |>
+  mutate(precio = if_else(p_log_precio < 0.05, "Estacionaria", "Raíz unitaria"),
+         rend   = if_else(p_rendimiento < 0.05, "Estacionaria", "Raíz unitaria"))
+knitr::kable(adf_tab, digits = 4, caption = "ADF diario (H0: raíz unitaria). p = 0.01 significa p <= 0.01")
+```
+
+El log-precio tiene raíz unitaria (p alto) y el rendimiento es estacionario (p ≈ 0.01). Por eso modelamos el **log-precio con ARIMA(p, 1, q)**: la diferencia ($d=1$) es justamente el rendimiento.
+
+## Selección Box-Jenkins, validación y pronóstico
+
+Para cada acción y frecuencia:
+
+1. Se reserva la **última sesión** (78 barras de 5 min o 13 de 30 min) o los **últimos 20 días** (diario) para validar fuera de muestra.
+2. Se elige el ARIMA(p,1,q) con menor **AIC** (`auto.arima`). Con BIC, más estricto, casi todas las series quedan como ARIMA(0,1,0), es decir, una caminata aleatoria; puedes comprobarlo cambiando `CRITERIO`.
+3. Se compara su RMSE contra el **modelo ingenuo** (caminata aleatoria: último precio).
+4. Se reestima con toda la muestra y se **pronostica la siguiente sesión** (lunes 9 de noviembre).
+
+```{r arima_funcion}
+HOLD <- c("5 min" = 78, "30 min" = 13, "Diario" = 20)   # validación fuera de muestra
+HFC  <- c("5 min" = 78, "30 min" = 13, "Diario" = 5)    # pronóstico hacia adelante
+CRITERIO <- "aic"   # "bic" es más estricto y casi siempre elige la caminata aleatoria ARIMA(0,1,0)
+
+serie_log <- function(frec, tk) {
+  src <- switch(frec, "5 min" = p5, "30 min" = p30, "Diario" = filter(pd_, fecha >= INICIO_D))
+  s <- src |> filter(ticker == tk) |> arrange(fh)
+  list(y = log(s$close), fh = s$fh)
+}
+
+# La deriva (tendencia) solo se permite en diario: en intradía una deriva estimada con
+# un mes de datos se acumularía 78 veces en una sesión y daría pronósticos irreales.
+ajustar_arima <- function(y, deriva = TRUE) {
+  auto.arima(y, d = 1, max.p = 3, max.q = 3, ic = CRITERIO,
+             stepwise = TRUE, approximation = FALSE, allowdrift = deriva)
+}
+
+etiqueta_arima <- function(m) {
+  o <- arimaorder(m)
+  paste0(sprintf("ARIMA(%d,1,%d)", o[1], o[3]), if ("drift" %in% names(coef(m))) " c/deriva" else "")
+}
+
+arima_eval <- function(frec, tk) {
+  s <- serie_log(frec, tk); y <- s$y
+  H <- HOLD[[frec]]
+  y_tr <- head(y, -H); y_te <- tail(y, H)
+
+  m_tr <- ajustar_arima(y_tr, deriva = frec == "Diario")
+  fc   <- forecast(m_tr, h = H, level = 95)
+  real <- exp(y_te); med <- exp(as.numeric(fc$mean))
+  li   <- exp(as.numeric(fc$lower)); ls <- exp(as.numeric(fc$upper))
+  ing  <- rep(exp(tail(y_tr, 1)), H)
+
+  m_full <- ajustar_arima(y, deriva = frec == "Diario")
+  fc_f   <- forecast(m_full, h = HFC[[frec]], level = 95)
+  p0     <- exp(tail(y, 1))
+  pf     <- exp(as.numeric(fc_f$mean))
+
+  ord <- arimaorder(m_full)
+  lb  <- Box.test(residuals(m_full), lag = 10, type = "Ljung-Box", fitdf = ord[1] + ord[3])$p.value
+
+  tibble(frecuencia = frec, ticker = tk,
+         modelo_validacion = etiqueta_arima(m_tr),
+         modelo_pronostico = etiqueta_arima(m_full),
+         LjungBox_p = lb,
+         RMSE_ARIMA = sqrt(mean((med - real)^2)),
+         RMSE_ingenuo = sqrt(mean((ing - real)^2)),
+         ganador = case_when(abs(RMSE_ARIMA - RMSE_ingenuo) < 1e-8 ~ "Empate (caminata aleatoria)",
+                             RMSE_ARIMA < RMSE_ingenuo ~ "ARIMA", TRUE ~ "Ingenuo"),
+         cobertura_IC95 = mean(real >= li & real <= ls),
+         precio_actual = p0,
+         pronostico_fin = tail(pf, 1),
+         IC95_inf = exp(tail(as.numeric(fc_f$lower), 1)),
+         IC95_sup = exp(tail(as.numeric(fc_f$upper), 1)),
+         rend_esperado = 100 * log(tail(pf, 1) / p0))
+}
+```
+
+
+
+```{r arima_todas}
+arima_res <- expand_grid(frecuencia = names(FRECS), ticker = ACCIONES) |>
+  pmap_dfr(function(frecuencia, ticker) arima_eval(frecuencia, ticker))
+
+arima_res |>
+  select(frecuencia, ticker, modelo_validacion, RMSE_ARIMA, RMSE_ingenuo, ganador, cobertura_IC95) |>
+  knitr::kable(digits = 3, caption = "Validación fuera de muestra (última sesión / últimos 20 días)")
+
+arima_res |>
+  select(frecuencia, ticker, modelo_pronostico, LjungBox_p, precio_actual, pronostico_fin,
+         IC95_inf, IC95_sup, rend_esperado) |>
+  knitr::kable(digits = 2,
+               caption = "Pronóstico: cierre del lunes 9-nov (intradía) y a 5 días (diario)")
+```
+
+```{r arima_grafica, fig.height = 3.5}
+graficar_pronostico <- function(frec, tk, ultimos) {
+  s  <- serie_log(frec, tk)
+  m  <- ajustar_arima(s$y, deriva = frec == "Diario")
+  fc <- forecast(m, h = HFC[[frec]], level = c(80, 95))
+  n  <- length(s$y)
+  x_hist <- (n - ultimos + 1):n
+  x_fc   <- n + seq_len(HFC[[frec]])
+  plot(x_hist, exp(s$y[x_hist]), type = "l", xlim = c(min(x_hist), max(x_fc)),
+       ylim = range(exp(c(s$y[x_hist], fc$lower[, 2], fc$upper[, 2]))),
+       xlab = paste("Barras de", frec), ylab = "USD", cex.main = 0.9,
+       main = sprintf("%s %s: %s", tk, frec, etiqueta_arima(m)))
+  polygon(c(x_fc, rev(x_fc)), exp(c(fc$lower[, 2], rev(fc$upper[, 2]))),
+          col = adjustcolor("red", 0.15), border = NA)
+  polygon(c(x_fc, rev(x_fc)), exp(c(fc$lower[, 1], rev(fc$upper[, 1]))),
+          col = adjustcolor("red", 0.25), border = NA)
+  lines(x_fc, exp(fc$mean), col = "red", lwd = 2, lty = 2)
+}
+
+# Una fila por acción: 5 min (últimas 3 sesiones), 30 min (últimas 10) y diario (últimos 120 días)
+for (tk in ACCIONES) {
+  par(mfrow = c(1, 3), mar = c(4, 4, 2.5, 1))
+  graficar_pronostico("5 min",  tk, 78 * 3)
+  graficar_pronostico("30 min", tk, 13 * 10)
+  graficar_pronostico("Diario", tk, 120)
+}
+par(mfrow = c(1, 1))
+```
+
+
+# Volatilidad: ARCH y GARCH
+
+$$r_t = \mu + u_t,\quad u_t = \sigma_t z_t,\qquad \sigma_t^2 = \omega + \alpha u_{t-1}^2 + \beta \sigma_{t-1}^2 \;\;(+\;\gamma\, u_{t-1}^2 I_{u_{t-1}<0}\ \text{en GJR})$$
+
+Se estima GARCH(1,1) y GJR-GARCH(1,1) con distribución **t** para cada acción con rendimientos **diarios** (desde 2022) y de **30 min** (excluyendo el salto nocturno). A 5 min no se estima, porque la forma de "J" invertida de la volatilidad intradía domina la dinámica y requeriría un modelo estacional.
+
+```{r garch_funcion}
+spec_garch <- ugarchspec(
+  variance.model     = list(model = "sGARCH", garchOrder = c(1, 1)),
+  mean.model         = list(armaOrder = c(0, 0), include.mean = TRUE),
+  distribution.model = "std")
+spec_gjr <- ugarchspec(
+  variance.model     = list(model = "gjrGARCH", garchOrder = c(1, 1)),
+  mean.model         = list(armaOrder = c(0, 0), include.mean = TRUE),
+  distribution.model = "std")
+
+ajustar_garch <- function(r, spec) {
+  fit <- tryCatch(ugarchfit(spec, data = r, solver = "hybrid"), error = function(e) NULL)
+  if (is.null(fit) || convergence(fit) != 0) return(NULL)
+  fit
+}
+
+garch_eval <- function(r, tk, frec) {
+  r <- as.numeric(na.omit(r))
+  arch_p <- ArchTest(r - mean(r), lags = 10)$p.value
+  g  <- ajustar_garch(r, spec_garch)
+  gj <- ajustar_garch(r, spec_gjr)
+  if (is.null(g)) return(list(tabla = tibble(frecuencia = frec, ticker = tk, ARCH_LM_p = arch_p),
+                              fit = NULL))
+  cf <- coef(g)
+  vol1 <- as.numeric(sigma(ugarchforecast(g, n.ahead = 1)))
+  list(fit = g,
+       tabla = tibble(frecuencia = frec, ticker = tk, ARCH_LM_p = arch_p,
+                      alpha = cf[["alpha1"]], beta = cf[["beta1"]],
+                      persistencia = cf[["alpha1"]] + cf[["beta1"]],
+                      nu_t = cf[["shape"]],
+                      gamma_GJR = if (is.null(gj)) NA_real_ else coef(gj)[["gamma1"]],
+                      AIC_GARCH = infocriteria(g)["Akaike", ],
+                      AIC_GJR   = if (is.null(gj)) NA_real_ else infocriteria(gj)["Akaike", ],
+                      vol_siguiente = vol1,
+                      vol_media_muestra = sd(r)))
+}
+```
+
+```{r garch_todas}
+garch_d  <- map(ACCIONES, ~ garch_eval(RD[, .x],  .x, "Diario")) |> set_names(ACCIONES)
+garch_30 <- map(ACCIONES, ~ garch_eval(R30[, .x], .x, "30 min")) |> set_names(ACCIONES)
+
+garch_tab <- bind_rows(map_dfr(garch_d, "tabla"), map_dfr(garch_30, "tabla")) |>
+  mutate(mejor = if_else(AIC_GJR < AIC_GARCH, "GJR", "GARCH"),
+         vida_media = log(0.5) / log(persistencia))
+knitr::kable(garch_tab, digits = 3,
+             caption = "GARCH(1,1)-t y GJR-GARCH: parámetros y volatilidad pronosticada (% por periodo)")
+```
+
+```{r garch_grafica, fig.height = 6}
+fechas_rd <- as.Date(index(RD))
+
+# Volatilidad condicional anualizada de cada acción (omite las que no convergieron)
+vol_df <- imap_dfr(garch_d, function(x, tk) {
+  if (is.null(x$fit)) return(NULL)
+  tibble(ticker = tk, fecha = fechas_rd,
+         vol_anual = as.numeric(sigma(x$fit)) * sqrt(252))
+}) |>
+  mutate(ticker = factor(ticker, levels = ACCIONES))
+
+# Volatilidad promedio de la muestra (referencia)
+vol_media <- tibble(ticker = factor(ACCIONES, levels = ACCIONES),
+                    vol_hist = sapply(ACCIONES, function(tk) sd(RD[, tk]) * sqrt(252)))
+
+ggplot(vol_df, aes(fecha, vol_anual)) +
+  geom_line(linewidth = 0.3, colour = "steelblue") +
+  geom_hline(data = vol_media, aes(yintercept = vol_hist),
+             colour = "red", linetype = "dashed") +
+  facet_wrap(~ ticker, ncol = 5, scales = "free_y") +
+  labs(title = "Volatilidad condicional anualizada: GARCH(1,1)-t diario (2022-2026)",
+       subtitle = "Línea roja punteada: volatilidad promedio de la muestra",
+       x = NULL, y = "% anualizada") +
+  theme_minimal()
+```
+
+# Estrategia de portafolio para HowMarketsWorks
+
+1. **Riesgo:** volatilidad de la sesión del lunes pronosticada con GARCH(1,1)-t sobre rendimientos de apertura a cierre, y correlación de los residuos estandarizados (modelo CCC).
+2. **Rendimiento esperado:** promedio de apertura a cierre de los últimos 252 días.
+3. **Tres portafolios:** pesos iguales (1/N), **mínima varianza** y **máximo Sharpe**, con un tope de `r TOPE_PESO*100`% por acción y solo posiciones largas.
+4. **VaR 95% de la sesión** (en % y en USD) y **número de acciones** a comprar con USD 894,529.21.
+
+```{r portafolio_sigma}
+# Rendimiento de la sesión: de la apertura al cierre del mismo día (sin el salto nocturno)
+ROC <- pd_ |>
+  filter(ticker %in% ACCIONES, fecha >= INICIO_D) |>
+  mutate(ret_oc = 100 * log(close / open)) |>
+  select(fecha, ticker, ret_oc) |>
+  pivot_wider(names_from = ticker, values_from = ret_oc) |>
+  arrange(fecha)
+ROC <- na.omit(xts(select(ROC, all_of(ACCIONES)), order.by = ROC$fecha))
+
+# GARCH(1,1)-t sobre los rendimientos de apertura a cierre: pronóstico de la volatilidad del lunes
+garch_oc <- map(ACCIONES, ~ garch_eval(ROC[, .x], .x, "Apertura-cierre")) |> set_names(ACCIONES)
+knitr::kable(map_dfr(garch_oc, "tabla"), digits = 3,
+             caption = "GARCH sobre rendimientos de apertura a cierre (% por sesión)")
+
+vol_g <- sapply(ACCIONES, function(tk) {
+  x <- garch_oc[[tk]]$tabla$vol_siguiente
+  if (is.null(x) || is.na(x)) sd(ROC[, tk]) else x
+})
+z <- sapply(ACCIONES, function(tk) {
+  f <- garch_oc[[tk]]$fit
+  if (is.null(f)) as.numeric(scale(ROC[, tk])) else as.numeric(residuals(f, standardize = TRUE))
+})
+corr  <- cor(z, use = "pairwise.complete.obs")
+Sigma <- diag(vol_g) %*% corr %*% diag(vol_g)
+Sigma <- (Sigma + t(Sigma)) / 2
+dimnames(Sigma) <- list(ACCIONES, ACCIONES)
+
+mu <- colMeans(tail(ROC, 252))     # rendimiento promedio por sesión (%) del último año
+beta_d <- with(filter(betas, frecuencia == "Diario"), setNames(beta, as.character(ticker)))
+rf <- RF_ANUAL / 252
+
+knitr::kable(tibble(ticker = ACCIONES, rend_prom_sesion = mu, vol_lunes_GARCH = vol_g),
+             digits = 3, caption = "Insumos del portafolio (% por sesión)")
+round(corr, 2)
+```
+
+```{r portafolio_pesos}
+n <- length(ACCIONES)
+
+# Mínima varianza: min w'Σw  s.a.  sum(w) = 1, 0 <= w <= tope
+sol_mv <- solve.QP(Dmat = 2 * Sigma, dvec = rep(0, n),
+                   Amat = cbind(rep(1, n), diag(n), -diag(n)),
+                   bvec = c(1, rep(0, n), rep(-TOPE_PESO, n)), meq = 1)
+w_mv <- pmax(sol_mv$solution, 0); w_mv <- w_mv / sum(w_mv)
+
+# Máximo Sharpe (cartera tangente). Cambio de variable y = w / k:
+# min y'Σy  s.a.  (mu - rf)'y = 1,  y >= 0,  y_i <= tope * sum(y)
+exceso <- mu - rf
+w_ms <- tryCatch({
+  A <- cbind(exceso, diag(n), TOPE_PESO * matrix(1, n, n) - diag(n))
+  s <- solve.QP(Dmat = 2 * Sigma, dvec = rep(0, n), Amat = A,
+                bvec = c(1, rep(0, n), rep(0, n)), meq = 1)
+  y <- pmax(s$solution, 0); y / sum(y)
+}, error = function(e) {
+  message("Ninguna acción tiene rendimiento esperado > rf: se usa mínima varianza")
+  w_mv
+})
+
+pesos <- data.frame("Igual (1/N)" = rep(1 / n, n), "Min. varianza" = w_mv,
+                    "Max. Sharpe" = w_ms, row.names = ACCIONES, check.names = FALSE)
+
+metricas <- sapply(pesos, function(w) {
+  sig <- sqrt(as.numeric(t(w) %*% Sigma %*% w))
+  rp  <- as.numeric(tail(ROC, 252) %*% w)
+  c("Rend. esperado por sesión (%)" = sum(w * mu),
+    "Vol. pronosticada sesión (%)"  = sig,
+    "Sharpe anualizado"             = (sum(w * mu) - rf) / sig * sqrt(252),
+    "VaR 95% sesión param. (%)"     = 1.645 * sig,
+    "VaR 95% sesión histórico (%)"  = -quantile(rp, 0.05, names = FALSE),
+    "VaR 95% sesión (USD)"          = 1.645 * sig / 100 * CAPITAL * (1 - COLCHON),
+    "Beta del portafolio"           = sum(w * beta_d[ACCIONES]))
+})
+
+knitr::kable(round(pesos, 3), caption = "Pesos por estrategia")
+knitr::kable(round(metricas, 2), caption = "Riesgo y rendimiento esperado")
+```
+
+## Órdenes de compra para HowMarketsWorks
+
+```{r ordenes}
+ESTRATEGIA <- "Max. Sharpe"     # cambia a "Min. varianza" o "Igual (1/N)"
+
+ultimo <- pd_ |> filter(ticker %in% ACCIONES) |> group_by(ticker) |>
+  slice_max(fecha, n = 1) |> ungroup() |> select(ticker, fecha, close)
+
+CAPITAL_INV <- CAPITAL * (1 - COLCHON)
+
+ordenes <- tibble(ticker = ACCIONES, peso = pesos[[ESTRATEGIA]]) |>
+  left_join(ultimo, by = "ticker") |>
+  mutate(monto_objetivo  = peso * CAPITAL_INV,
+         acciones        = floor(monto_objetivo / close),
+         monto_invertido = acciones * close,
+         vol_sesion      = vol_g[ticker],                                # % GARCH apertura-cierre
+         stop_loss_ref   = close * exp(-MULT_SL * vol_sesion / 100),
+         take_profit_ref = close * exp( MULT_SL * vol_sesion / 100)) |>
+  filter(acciones > 0)
+
+knitr::kable(ordenes, digits = 2,
+             caption = sprintf("Órdenes para el lunes 9-nov con USD %s (referencia: cierre del %s)",
+                               format(CAPITAL, big.mark = ",", nsmall = 2, scientific = FALSE),
+                               max(ultimo$fecha)))
+cat(sprintf("Invertido: USD %s | Efectivo restante: USD %s\n",
+            format(round(sum(ordenes$monto_invertido)), big.mark = ","),
+            format(round(CAPITAL - sum(ordenes$monto_invertido)), big.mark = ",")))
+```
+
+**Cómo interpretar**
+
+- **Mínima varianza** carga más peso en las acciones de baja volatilidad y baja correlación con el resto (LLY, JPM, HCA). **Máximo Sharpe** además premia a las de mejor rendimiento reciente, así que tiene más *momentum* y más riesgo.
+- El **tope de 25%** evita que el optimizador concentre todo en 2 o 3 acciones; la media histórica es un estimador muy ruidoso del rendimiento futuro.
+- **VaR 95%:** la pérdida de un día que solo se debería superar 1 de cada 20 días. Si el VaR histórico es mayor que el paramétrico, las colas son más pesadas que en una normal.
+- Los niveles de **stop-loss y take-profit** de referencia están a ±1.5 desviaciones estándar de la sesión (GARCH de apertura a cierre); se pueden capturar como órdenes límite en HowMarketsWorks..
+- Las compras se hacen al precio de apertura del lunes, no al cierre del viernes. Ajusta `acciones` si el precio abre muy distinto.
+
+
